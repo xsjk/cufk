@@ -1,0 +1,12 @@
+BasedOnStyle: LLVM
+IndentWidth: 2
+ColumnLimit: 160
+AlignAfterOpenBracket: DontAlign
+AllowShortFunctionsOnASingleLine: Empty
+BinPackArguments: false
+BinPackParameters: false
+BreakTemplateDeclarations: Yes
+Cpp11BracedListStyle: false
+IndentPPDirectives: BeforeHash
+PenaltyReturnTypeOnItsOwnLine: 1000000
+PointerAlignment: Left
