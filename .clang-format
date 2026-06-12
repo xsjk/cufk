@@ -1,7 +1,8 @@
 BasedOnStyle: LLVM
 IndentWidth: 2
 ColumnLimit: 160
-AlignAfterOpenBracket: DontAlign
+AlignAfterOpenBracket: AlwaysBreak
+AllowAllParametersOfDeclarationOnNextLine: false
 AllowShortFunctionsOnASingleLine: Empty
 BinPackArguments: false
 BinPackParameters: false

@@ -89,7 +89,8 @@ struct Mat3T {
   }
 
   __host__ __device__ __forceinline__ static Mat3T identity() {
-    return from_rows({ scalar<T>(1.0f), scalar<T>(0.0f), scalar<T>(0.0f) },
+    return from_rows(
+        { scalar<T>(1.0f), scalar<T>(0.0f), scalar<T>(0.0f) },
         { scalar<T>(0.0f), scalar<T>(1.0f), scalar<T>(0.0f) },
         { scalar<T>(0.0f), scalar<T>(0.0f), scalar<T>(1.0f) });
   }

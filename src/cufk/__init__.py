@@ -6,23 +6,27 @@ __version__ = "0.1.0"
 
 BLOCK_SCAN_MAX_POINT_COUNT = 2051
 
-__all__ = ["BLOCK_SCAN_MAX_POINT_COUNT", "__version__", "reconstruct"]
+__all__ = [
+    "BLOCK_SCAN_MAX_POINT_COUNT",
+    "__version__",
+    "reconstruct",
+]
 
-_ANCHORS: dict[tuple[torch.device, torch.dtype, str], torch.Tensor] = {}
+_SUPPORTED_TYPES = (torch.float32, torch.float64, torch.float16, torch.bfloat16)
 
 
 def _batched_inputs(
     lengths: torch.Tensor,
     angles: torch.Tensor,
     dihedrals: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, bool]:
+) -> tuple[torch.Tensor, torch.Tensor, bool]:
     assert torch.cuda.is_available(), "CUDA must be available"
     single = lengths.dim() == 1
     assert lengths.dim() in (1, 2), "lengths must have shape (N-1,) or (B, N-1)"
     assert angles.dim() == lengths.dim(), "angles must have the same rank as lengths"
     assert dihedrals.dim() == lengths.dim(), "dihedrals must have the same rank as lengths"
     assert lengths.is_cuda and angles.is_cuda and dihedrals.is_cuda, "inputs must be CUDA"
-    assert lengths.dtype in (torch.float32, torch.float64, torch.float16, torch.bfloat16), "inputs must be float32, float64, float16, or bfloat16"
+    assert lengths.dtype in _SUPPORTED_TYPES, "inputs must be float32, float64, float16, or bfloat16"
     assert angles.dtype == lengths.dtype and dihedrals.dtype == lengths.dtype, "inputs must have the same dtype"
     if single:
         lengths, angles, dihedrals = lengths[None], angles[None], dihedrals[None]
@@ -40,10 +44,7 @@ def _anchor(
     name: str,
 ) -> torch.Tensor:
     if x is None:
-        key = (ref.device, ref.dtype, name)
-        if key not in _ANCHORS:
-            _ANCHORS[key] = torch.tensor(vals, device=ref.device, dtype=ref.dtype)
-        x = _ANCHORS[key]
+        x = torch.tensor(vals, device=ref.device, dtype=ref.dtype)
     assert x.shape == (3,), f"{name} must have shape (3,)"
     assert x.device == ref.device, f"{name} must be on the same device as lengths"
     assert x.dtype == ref.dtype, f"{name} must have the same dtype as lengths"
@@ -51,30 +52,26 @@ def _anchor(
     return x.contiguous()
 
 
-class _ReconstructSavedPrefix(torch.autograd.Function):
-    @staticmethod
-    def forward(
-        ctx,
-        lengths: torch.Tensor,
-        angles: torch.Tensor,
-        dihedrals: torch.Tensor,
-        p0: torch.Tensor,
-        first_direction: torch.Tensor,
-        initial_normal: torch.Tensor,
-    ) -> torch.Tensor:
-        lengths, angles, dihedrals = lengths.contiguous(), angles.contiguous(), dihedrals.contiguous()
-        xyz, prefix = _C.forward_with_prefix(lengths, angles, dihedrals, p0, first_direction, initial_normal)
-        ctx.save_for_backward(lengths, angles, dihedrals, p0, first_direction, initial_normal, prefix)
-        return xyz
-
-    @staticmethod
-    def backward(ctx, grad_xyz: torch.Tensor):
-        lengths, angles, dihedrals, p0, first_direction, initial_normal, prefix = ctx.saved_tensors
-        grad_lengths, grad_angles, grad_dihedrals = _C.backward_with_prefix(lengths, angles, dihedrals, p0, first_direction, initial_normal, grad_xyz.contiguous(), prefix)
-        return grad_lengths, grad_angles, grad_dihedrals, None, None, None
+def _anchors(
+    p0: torch.Tensor | None,
+    first_direction: torch.Tensor | None,
+    initial_normal: torch.Tensor | None,
+    ref: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    return (
+        _anchor(p0, (0.0, 0.0, 0.0), ref, "p0"),
+        _anchor(first_direction, (1.0, 0.0, 0.0), ref, "first_direction"),
+        _anchor(initial_normal, (0.0, 0.0, 1.0), ref, "initial_normal"),
+    )
 
 
-class _ReconstructRecompute(torch.autograd.Function):
+def _unbatch(xyz: torch.Tensor, single: bool) -> torch.Tensor:
+    if single:
+        return xyz[0]
+    return xyz
+
+
+class _ReconstructFn(torch.autograd.Function):
     @staticmethod
     def forward(
         ctx,
@@ -93,7 +90,9 @@ class _ReconstructRecompute(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_xyz: torch.Tensor):
         lengths, angles, dihedrals, p0, first_direction, initial_normal = ctx.saved_tensors
-        grad_lengths, grad_angles, grad_dihedrals = _C.backward_recompute(lengths, angles, dihedrals, p0, first_direction, initial_normal, grad_xyz.contiguous())
+        grad_lengths, grad_angles, grad_dihedrals = _C.backward(
+            lengths, angles, dihedrals, p0, first_direction, initial_normal, grad_xyz.contiguous()
+        )
         return grad_lengths, grad_angles, grad_dihedrals, None, None, None
 
 
@@ -123,17 +122,10 @@ def reconstruct(
     coordinates only.
     """
     lengths, angles, dihedrals, single = _batched_inputs(lengths, angles, dihedrals)
-    p0 = _anchor(p0, (0.0, 0.0, 0.0), lengths, "p0")
-    first_direction = _anchor(first_direction, (1.0, 0.0, 0.0), lengths, "first_direction")
-    initial_normal = _anchor(initial_normal, (0.0, 0.0, 1.0), lengths, "initial_normal")
+    p0, first_direction, initial_normal = _anchors(p0, first_direction, initial_normal, lengths)
     assert lengths.shape[1] + 1 <= BLOCK_SCAN_MAX_POINT_COUNT, f"reconstruct supports at most {BLOCK_SCAN_MAX_POINT_COUNT} points"
     if torch.is_grad_enabled() and (lengths.requires_grad or angles.requires_grad or dihedrals.requires_grad):
-        if lengths.dtype == torch.float64:
-            xyz = _ReconstructSavedPrefix.apply(lengths, angles, dihedrals, p0, first_direction, initial_normal)
-        else:
-            xyz = _ReconstructRecompute.apply(lengths, angles, dihedrals, p0, first_direction, initial_normal)
+        xyz = _ReconstructFn.apply(lengths, angles, dihedrals, p0, first_direction, initial_normal)
     else:
         xyz = _C.forward(lengths.contiguous(), angles.contiguous(), dihedrals.contiguous(), p0, first_direction, initial_normal)
-    if single:
-        return xyz[0]
-    return xyz
+    return _unbatch(xyz, single)

@@ -33,12 +33,12 @@ Inputs are CUDA `float32`, `float64`, `float16`, or `bfloat16` tensors shaped `(
 
 Optional anchors `p0`, `first_direction`, and `initial_normal` are shared `(3,)` CUDA tensors with the same dtype as `lengths`. Anchor gradients are not supported. Gradients are returned for `lengths`, `angles`, and `dihedrals`.
 
-`reconstruct` uses the fused block affine kernel for `N <= 2051`. No-grad calls use the fastest forward-only path. Calls that need non-double gradients recompute the affine prefix inside the custom backward to avoid saving the full prefix tensor. `float64` keeps the saved-prefix backward path because full-size double prefixes are too large for the shared-memory recompute path. Low-precision dtypes run the scan payload in the same low-precision type; this is experimental and can accumulate substantial error on long chains.
+`reconstruct` uses the fused block affine kernel for `N <= 2051`. No-grad calls use the forward-only path. Calls that need gradients use one custom backward kernel that rebuilds the affine prefix in shared memory. Low-precision dtypes run the scan payload in the same low-precision type; this is experimental and can accumulate substantial error on long chains.
 
 Long-chain and multi-kernel comparison implementations live in `coord_scan_repro`; this package keeps only the block path used as the production interface.
 
 ## Implementation
 
-This package keeps one production route: a fused block affine scan. No-grad and non-double autograd forward use `block_forward_kernel`; non-double backward uses `block_backward_recompute_kernel`; double backward uses the saved-prefix pair `block_forward_prefix_kernel` and `block_backward_kernel`.
+This package keeps one generic production route: `block_forward_kernel` plus `block_backward_kernel`.
 
 Scan choices are compile-time internals. Device-wide and tiled experiments live in `coord_scan_repro`; CUB is only a block-scan primitive here, not a public implementation.
