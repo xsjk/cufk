@@ -7,9 +7,9 @@ from typing import Final, Protocol, cast
 import torch
 from torch.utils.cpp_extension import load
 
-_PROJECT_ROOT: Final[Path] = Path(__file__).resolve().parents[2]
-_TORSION_SOURCES: Final[list[str]] = [str(_PROJECT_ROOT / "csrc" / "torsion.cu")]
-_CUDA_DEPENDENCIES: Final[list[str]] = [str(path) for path in sorted((_PROJECT_ROOT / "csrc").glob("*.cuh"))]
+_CUDA_SOURCE_ROOT: Final[Path] = Path(__file__).resolve().parent / "csrc"
+_TORSION_SOURCES: Final[list[str]] = [str(_CUDA_SOURCE_ROOT / "torsion.cu")]
+_CUDA_DEPENDENCIES: Final[list[str]] = [str(path) for path in sorted(_CUDA_SOURCE_ROOT.glob("*.cuh"))]
 _LOAD_HAS_DEPENDS: Final[bool] = "depends" in inspect.signature(load).parameters
 
 

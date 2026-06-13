@@ -4,7 +4,7 @@ from setuptools import setup
 from torch.utils.cpp_extension import BuildExtension, CUDAExtension
 
 ROOT = Path(__file__).parent
-CSRC = ROOT / "csrc"
+CSRC = ROOT / "src" / "cufk" / "csrc"
 
 
 def _rel(path: Path) -> str:
