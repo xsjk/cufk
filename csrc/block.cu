@@ -1,14 +1,18 @@
+#include <torch/autograd.h>
 #include <torch/extension.h>
 
 #include "affine.cuh"
-#include "affine_scan.cuh"
 #include "extension_utils.cuh"
 #include "frame_utils.cuh"
 #include "math.cuh"
+#include "scan.cuh"
+
+#include <cuda/std/functional>
 
 #include <cstdint>
-#include <type_traits>
 
+using cuda::std::multiplies;
+using cuda::std::plus;
 using cufk::ext::chain_shape_from_steps;
 using cufk::ext::ChainAnchors;
 using cufk::ext::ChainLaunch;
@@ -17,6 +21,7 @@ using cufk::ext::check_cuda_float;
 using cufk::ext::check_like;
 using cufk::ext::checked_chain_anchors;
 using cufk::ext::CheckedChainInputs;
+using cufk::ext::contiguous_or_self;
 using cufk::ext::dispatch_dtype;
 using cufk::ext::dynamic_shared_plan_limit;
 using cufk::ext::empty_xyz_like;
@@ -25,14 +30,12 @@ using cufk::ext::launch_block_plan;
 using cufk::ext::plan_capacity;
 using cufk::ext::set_max_dynamic_shared_memory;
 using cufk::ext::Tensor;
-using cufk::ext::tensor_ptr;
 using cufk::ext::TensorList;
 using cufk::frame::normalized;
 using cufk::frame::stable_perpendicular;
 
 namespace {
 
-using BlockScanBackend = cufk::scan::CustomScanBackend;
 using Shape = ChainShape;
 
 constexpr float kEps = 1.0e-12f;
@@ -68,21 +71,10 @@ struct ForwardScanPlan<double> {
 };
 
 template <typename T>
-struct GradScanPlan : ForwardScanPlan<T> {};
+struct BackwardScanPlan : ForwardScanPlan<T> {};
 
 template <>
-struct GradScanPlan<double> {
-  static constexpr int tiny_threads = 128;
-  static constexpr int tiny_items = 2;
-  static constexpr int small_threads = 256;
-  static constexpr int small_items = 2;
-  static constexpr int mid_threads = 256;
-  static constexpr int mid_items = 4;
-  static constexpr int full_threads = 256;
-  static constexpr int full_items = 8;
-};
-
-struct WideBackwardScanPlan {
+struct BackwardScanPlan<double> {
   static constexpr int tiny_threads = 128;
   static constexpr int tiny_items = 2;
   static constexpr int small_threads = 128;
@@ -93,11 +85,7 @@ struct WideBackwardScanPlan {
   static constexpr int full_items = 8;
 };
 
-template <typename T>
-struct BackwardScanPlan
-    : std::conditional_t<(sizeof(cufk::affine::AffineT<T>) > sizeof(cufk::affine::AffineT<float>)), WideBackwardScanPlan, GradScanPlan<T>> {};
-
-constexpr int kMaxBlockScanSteps = plan_capacity<GradScanPlan<float>>();
+constexpr int kMaxSteps = plan_capacity<ForwardScanPlan<float>>();
 
 using cufk::scalar;
 using cufk::to_real;
@@ -202,8 +190,10 @@ __global__ void __launch_bounds__(BlockThreads) block_forward_kernel(
     input[item] = step < steps ? Affine::local_transform(length_row[step + 2], angle_row[step + 1], dihedral_row[step]) : Affine::identity();
   }
 
-  cufk::affine_scan::forward_positions_in_place<BlockScanBackend, T, BlockThreads,
-                                                ItemsPerThread>(input);
+  const Affine carry = cufk::scan::inclusive_scan_carry<BlockThreads>(input, input, multiplies<>{}, Affine::identity());
+  unroll for (int item = 0; item < ItemsPerThread; ++item) {
+    input[item].v = (carry * input[item]).v;
+  }
 
   unroll for (int item = 0; item < ItemsPerThread; ++item) {
     const int step = first_step + item;
@@ -278,8 +268,7 @@ __global__ void __launch_bounds__(BlockThreads) block_backward_kernel(
     local[item] = step < steps ? Affine::local_transform(length_row[step + 2], angle_row[step + 1], dihedral_row[step]) : Affine::identity();
   }
 
-  cufk::affine_scan::saved_prefix<BlockScanBackend, T, BlockThreads,
-                                  ItemsPerThread>(local, prefix);
+  cufk::scan::inclusive_scan<BlockThreads>(local, prefix, multiplies<>{}, Affine::identity());
 
   unroll for (int item = 0; item < ItemsPerThread; ++item) {
     const int step = first_step + item;
@@ -295,7 +284,7 @@ __global__ void __launch_bounds__(BlockThreads) block_backward_kernel(
   unroll for (int item = 0; item < ItemsPerThread; ++item) {
     const int reverse_step = first_reverse_step + item;
     const int step = steps - 1 - reverse_step;
-    input[item] = Affine::zero();
+    input[item] = {};
     if (step >= 0) {
       const Affine& curr = prefix_row[step];
       const T* tail_grad = grad_row + (step + 3) * 3;
@@ -303,8 +292,7 @@ __global__ void __launch_bounds__(BlockThreads) block_backward_kernel(
     }
   }
 
-  cufk::affine_scan::suffix<BlockScanBackend, T, BlockThreads,
-                            ItemsPerThread>(input, suffix);
+  cufk::scan::inclusive_scan<BlockThreads>(input, suffix, plus<>{}, Affine{});
 
   unroll for (int item = 0; item < ItemsPerThread; ++item) {
     const int reverse_step = first_reverse_step + item;
@@ -325,59 +313,24 @@ __global__ void __launch_bounds__(BlockThreads) block_backward_kernel(
 }
 
 struct LaunchContext : ChainLaunch {
-  LaunchContext(const Tensor& lengths, Shape shape) : ChainLaunch(lengths, shape, kMaxBlockScanSteps, "reconstruct") {}
+  LaunchContext(const Tensor& lengths, Shape shape) : ChainLaunch(lengths, shape, kMaxSteps, "reconstruct") {}
 };
 
-struct GradOutputs {
-  Tensor lengths;
-  Tensor angles;
-  Tensor dihedrals;
-
-  TensorList list() const {
-    return { lengths, angles, dihedrals };
-  }
-};
-
-GradOutputs empty_grads_like(const Tensor& lengths, const Tensor& angles, const Tensor& dihedrals) {
-  return {
-    .lengths = torch::empty_like(lengths),
-    .angles = torch::empty_like(angles),
-    .dihedrals = torch::empty_like(dihedrals),
-  };
+template <typename T>
+Tensor forward_cuda_impl(const Tensor& lengths, Shape shape, const auto&... input) {
+  const LaunchContext run(lengths, shape);
+  Tensor xyz = empty_xyz_like(lengths, run.shape);
+  launch_block_plan<ForwardScanPlan<T>>(run.steps, [&]<int Threads, int Items>() {
+    constexpr auto kernel_ptr = block_forward_kernel<T, Threads, Items>;
+    kernel_ptr<<<run.shape.batch, Threads, 0, run.stream>>>(kernel_arg<T>(lengths), kernel_arg<T>(input)..., kernel_arg<T>(xyz), run.shape);
+  });
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  return xyz;
 }
 
 template <typename T>
-void launch_forward(const LaunchContext& run, const auto&... args) {
-  const auto kernel = [&]<int Threads, int Items>() {
-    block_forward_kernel<T, Threads, Items><<<run.shape.batch, Threads, 0, run.stream>>>(args..., run.shape);
-  };
-  launch_block_plan<ForwardScanPlan<T>>(run.steps, kernel);
-}
-
-template <typename T>
-void launch_backward(const LaunchContext& run, const auto&... args) {
-  const auto kernel = [&]<int Threads, int Items>() {
-    constexpr auto kernel_ptr = block_backward_kernel<T, Threads, Items>;
-    const int shared_bytes = static_cast<int>(run.steps * sizeof(AffineT<T>));
-    set_max_dynamic_shared_memory(kernel_ptr, shared_bytes);
-    kernel_ptr<<<run.shape.batch, Threads, shared_bytes, run.stream>>>(args..., run.shape);
-  };
-  launch_block_plan<BackwardScanPlan<T>>(run.steps, kernel);
-}
-
-template <typename T>
-void launch_forward_tensors(const LaunchContext& run, const auto&... args) {
-  launch_forward<T>(run, kernel_arg<T>(args)...);
-}
-
-template <typename T>
-void launch_backward_tensors(const LaunchContext& run, const GradOutputs& grad, const auto&... args) {
-  launch_backward<T>(
-      run, kernel_arg<T>(args)..., kernel_arg<T>(grad.lengths), kernel_arg<T>(grad.angles), kernel_arg<T>(grad.dihedrals));
-}
-
-template <typename T>
-void check_backward_steps(const LaunchContext& run) {
+TensorList backward_cuda_impl(const Tensor& lengths, Shape shape, const Tensor& angles, const Tensor& dihedrals, const auto&... input) {
+  const LaunchContext run(lengths, shape);
   const auto limit = dynamic_shared_plan_limit<BackwardScanPlan<T>, AffineT<T>>(run.device);
   TORCH_CHECK(
       run.steps <= limit.max,
@@ -390,25 +343,25 @@ void check_backward_steps(const LaunchContext& run) {
       ", shared-memory cap ",
       limit.shared,
       ")");
-}
-
-template <typename T>
-Tensor forward_cuda_impl(const Tensor& lengths, Shape shape, const auto&... input) {
-  const LaunchContext run(lengths, shape);
-  Tensor xyz = empty_xyz_like(lengths, run.shape);
-  launch_forward_tensors<T>(run, lengths, input..., xyz);
+  Tensor grad_lengths = torch::empty_like(lengths);
+  Tensor grad_angles = torch::empty_like(angles);
+  Tensor grad_dihedrals = torch::empty_like(dihedrals);
+  launch_block_plan<BackwardScanPlan<T>>(run.steps, [&]<int Threads, int Items>() {
+    constexpr auto kernel_ptr = block_backward_kernel<T, Threads, Items>;
+    const int shared_bytes = static_cast<int>(run.steps * sizeof(AffineT<T>));
+    set_max_dynamic_shared_memory(kernel_ptr, shared_bytes);
+    kernel_ptr<<<run.shape.batch, Threads, shared_bytes, run.stream>>>(
+        kernel_arg<T>(lengths),
+        kernel_arg<T>(angles),
+        kernel_arg<T>(dihedrals),
+        kernel_arg<T>(input)...,
+        kernel_arg<T>(grad_lengths),
+        kernel_arg<T>(grad_angles),
+        kernel_arg<T>(grad_dihedrals),
+        run.shape);
+  });
   C10_CUDA_KERNEL_LAUNCH_CHECK();
-  return xyz;
-}
-
-template <typename T>
-TensorList backward_cuda_impl(const Tensor& lengths, Shape shape, const Tensor& angles, const Tensor& dihedrals, const auto&... input) {
-  const LaunchContext run(lengths, shape);
-  check_backward_steps<T>(run);
-  const GradOutputs grad = empty_grads_like(lengths, angles, dihedrals);
-  launch_backward_tensors<T>(run, grad, lengths, angles, dihedrals, input...);
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
-  return grad.list();
+  return { grad_lengths, grad_angles, grad_dihedrals };
 }
 
 Shape check_geom(const Tensor& lengths, const Tensor& angles, const Tensor& dihedrals) {
@@ -437,42 +390,56 @@ CheckedChainInputs checked_inputs(
   };
 }
 
-} // namespace
+class ReconstructAutograd : public torch::autograd::Function<ReconstructAutograd> {
+public:
+  static Tensor forward(
+      torch::autograd::AutogradContext* ctx,
+      Tensor lengths,
+      Tensor angles,
+      Tensor dihedrals,
+      Tensor p0,
+      Tensor first_direction,
+      Tensor initial_normal) {
+    const CheckedChainInputs inputs = checked_inputs(lengths, angles, dihedrals, p0, first_direction, initial_normal);
+    const ChainAnchors& anchors = inputs.anchors;
+    Tensor xyz = dispatch_dtype(lengths, [&]<typename T>() {
+      return forward_cuda_impl<T>(lengths, inputs.shape, angles, dihedrals, anchors.p0, anchors.first_direction, anchors.initial_normal);
+    });
+    ctx->save_for_backward({ lengths, angles, dihedrals, anchors.p0, anchors.first_direction, anchors.initial_normal });
+    return xyz;
+  }
 
-Tensor forward(
+  static torch::autograd::tensor_list backward(torch::autograd::AutogradContext* ctx, torch::autograd::tensor_list grad_outputs) {
+    const auto saved = ctx->get_saved_variables();
+    const Tensor& lengths = saved[0];
+    const Tensor& angles = saved[1];
+    const Tensor& dihedrals = saved[2];
+    const Tensor& p0 = saved[3];
+    const Tensor& first_direction = saved[4];
+    const Tensor& initial_normal = saved[5];
+    Tensor grad_points = contiguous_or_self(grad_outputs[0]);
+    check_like(grad_points, lengths, "grad_points");
+    const CheckedChainInputs inputs = checked_inputs(lengths, angles, dihedrals, p0, first_direction, initial_normal);
+    const ChainAnchors& anchors = inputs.anchors;
+    TensorList grads = dispatch_dtype(lengths, [&]<typename T>() {
+      return backward_cuda_impl<T>(lengths, inputs.shape, angles, dihedrals, anchors.p0, anchors.first_direction, anchors.initial_normal, grad_points);
+    });
+    return { grads[0], grads[1], grads[2], Tensor(), Tensor(), Tensor() };
+  }
+};
+
+Tensor apply_autograd(
     const Tensor& lengths,
     const Tensor& angles,
     const Tensor& dihedrals,
     const Tensor& p0,
     const Tensor& first_direction,
     const Tensor& initial_normal) {
-  const CheckedChainInputs inputs = checked_inputs(lengths, angles, dihedrals, p0, first_direction, initial_normal);
-  const ChainAnchors& anchors = inputs.anchors;
-  const auto run = [&]<typename T>() {
-    return forward_cuda_impl<T>(lengths, inputs.shape, angles, dihedrals, anchors.p0, anchors.first_direction, anchors.initial_normal);
-  };
-  return dispatch_dtype(lengths, run);
+  return ReconstructAutograd::apply(lengths, angles, dihedrals, p0, first_direction, initial_normal);
 }
 
-TensorList backward(
-    const Tensor& lengths,
-    const Tensor& angles,
-    const Tensor& dihedrals,
-    const Tensor& p0,
-    const Tensor& first_direction,
-    const Tensor& initial_normal,
-    const Tensor& grad_points) {
-  check_like(grad_points, lengths, "grad_points");
-  const CheckedChainInputs inputs = checked_inputs(lengths, angles, dihedrals, p0, first_direction, initial_normal);
-  const ChainAnchors& anchors = inputs.anchors;
-  const auto run = [&]<typename T>() {
-    return backward_cuda_impl<T>(
-        lengths, inputs.shape, angles, dihedrals, anchors.p0, anchors.first_direction, anchors.initial_normal, grad_points);
-  };
-  return dispatch_dtype(lengths, run);
-}
+} // namespace
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-  m.def("forward", &forward, "forward");
-  m.def("backward", &backward, "backward");
+  m.def("apply", &apply_autograd, "reconstruct autograd apply");
 }

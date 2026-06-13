@@ -28,6 +28,10 @@ auto kernel_arg(const auto& x) {
   }
 }
 
+inline Tensor contiguous_or_self(const Tensor& x) {
+  return x.is_contiguous() ? x : x.contiguous();
+}
+
 template <typename Fn>
 decltype(auto) dispatch_dtype(const Tensor& ref, Fn fn) {
   switch (ref.scalar_type()) {
@@ -74,6 +78,7 @@ inline void check_anchor(const Tensor& x, const Tensor& ref, const char* name) {
   TORCH_CHECK(x.scalar_type() == ref.scalar_type(), name, " must have the same dtype as reference");
   TORCH_CHECK(x.device() == ref.device(), name, " must be on the same device as reference");
   TORCH_CHECK(x.sizes() == torch::IntArrayRef({ 3 }), name, " must have shape (3,)");
+  TORCH_CHECK(!x.requires_grad(), name, " gradients are not supported");
 }
 
 inline void check_chain_anchors(const Tensor& p0, const Tensor& first_direction, const Tensor& initial_normal, const Tensor& ref) {

@@ -61,10 +61,6 @@ struct alignas(sizeof(T) * 4) AffineT {
     return v + m * x;
   }
 
-  __host__ __device__ __forceinline__ static AffineT zero() {
-    return {};
-  }
-
   __host__ __device__ __forceinline__ static AffineT suffix_from_tail(const Vec3T<T>& tail, const AffineT& curr) {
     return {
       .m = outer(tail, curr.v),
